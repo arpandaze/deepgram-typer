@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::{debug, error, info};
 
 mod audio_input;
+mod daemon;
 mod input_event;
 mod stt_client;
 mod virtual_keyboard;
@@ -102,18 +103,33 @@ impl OriginalUser {
     }
 }
 
+fn get_socket_path() -> Result<std::path::PathBuf> {
+    // Use /tmp to avoid XDG_RUNTIME_DIR permission issues when daemon runs as root
+    // but client runs as user
+    Ok(std::path::PathBuf::from("/tmp").join("voice-keyboard.sock"))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("Starting Voice Keyboard v{}", env!("CARGO_PKG_VERSION"));
 
-    // Capture original user info before we do anything
-    let original_user = OriginalUser::capture();
-
     let matches = Command::new("voice-keyboard")
         .version(env!("CARGO_PKG_VERSION"))
         .about("Voice-controlled keyboard input")
+        .arg(
+            Arg::new("daemon")
+                .long("daemon")
+                .help("Run as a daemon service")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("listen")
+                .long("listen")
+                .help("Start listening for transcription (sends command to daemon)")
+                .action(clap::ArgAction::SetTrue),
+        )
         .arg(
             Arg::new("test-audio")
                 .long("test-audio")
@@ -151,6 +167,57 @@ async fn main() -> Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
+
+    // Handle --listen flag (client mode)
+    if matches.get_flag("listen") {
+        let socket_path = get_socket_path()?;
+        
+        // Check if socket exists first
+        if !socket_path.exists() {
+            error!("Daemon is not running. Socket not found: {:?}", socket_path);
+            error!("Please start the daemon first with: sudo -E ./target/debug/voice-keyboard --daemon");
+            error!("Or use the helper script: ./start-daemon.sh");
+            std::process::exit(1);
+        }
+        
+        let response = daemon::send_command(&socket_path, daemon::DaemonCommand::StartListening)
+            .await
+            .with_context(|| format!("Failed to communicate with daemon at {:?}. Is the daemon running?", socket_path))?;
+
+        match response {
+            daemon::DaemonResponse::Ok => {
+                info!("Started listening for transcription");
+            }
+            daemon::DaemonResponse::Error(msg) => {
+                error!("Daemon error: {}", msg);
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+
+        return Ok(());
+    }
+
+    // Handle --daemon flag (daemon mode)
+    if matches.get_flag("daemon") {
+        // Check if we need sudo
+        if !nix::unistd::getuid().is_root() {
+            error!("Daemon mode requires root privileges. Please run with sudo.");
+            std::process::exit(1);
+        }
+
+        let original_user = daemon::OriginalUser::capture();
+        let socket_path = get_socket_path()?;
+        let daemon = daemon::Daemon::new(socket_path.clone(), original_user)
+            .context("Failed to create daemon")?;
+
+        info!("Starting daemon...");
+        daemon.run().await?;
+        return Ok(());
+    }
+
+    // Legacy mode: direct execution (for testing)
+    let original_user = OriginalUser::capture();
 
     let device_name = "Voice Keyboard";
 
